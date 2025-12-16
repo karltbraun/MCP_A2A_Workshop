@@ -42,7 +42,8 @@ MCP_A2A_Workshop/
         ├── requirements.txt
         ├── venv/           # Virtual environment (gitignored)
         └── src/
-            └── mqtt_mcp_server.py
+            ├── mqtt_mcp_server.py
+            └── mqtt_cache.json  # Runtime cache (gitignored)
 ```
 
 ### 2. Environment Configuration
@@ -134,39 +135,36 @@ Example topics:
 
 ### Tool 1 -- list_uns_topics ✅
 
-Discovers available topics in the UNS by subscribing to wildcard and collecting messages.
+Lists all topics currently cached from the UNS.
 
 **Purpose:** Let Claude explore what data is available
 
 **Inputs:**
-- `base_path` (optional): MQTT wildcard pattern, default `#` for all topics
-- `timeout` (optional): Collection time in seconds, default 3
+- `base_path` (optional): Filter by topic prefix (e.g., `flexpack/packaging`)
 
-**Output:** List of discovered topic paths with current values
+**Output:** List of cached topic paths with current values (instant response)
 
 ### Tool 2 -- get_topic_value ✅
 
-Reads the current retained value from a specific topic.
+Gets the cached value for a specific topic.
 
 **Purpose:** Let Claude read a specific data point
 
 **Inputs:**
 - `topic` (required): Full topic path (e.g., `flexpack/packaging/line1/filler/speed`)
-- `timeout` (optional): Wait time in seconds, default 5
 
-**Output:** Current value, QoS, retain flag, and timestamp
+**Output:** Current value, timestamp, and age
 
 ### Tool 3 -- search_topics ✅
 
-Finds topics matching a pattern or keyword.
+Searches cached topics matching a pattern or keyword.
 
 **Purpose:** Let Claude find relevant topics without knowing exact paths
 
 **Inputs:**
 - `pattern` (required): Search string, glob pattern, or MQTT wildcard
-- `timeout` (optional): Discovery time in seconds, default 3
 
-**Output:** List of matching topics with values
+**Output:** List of matching topics with values (instant response)
 
 ---
 
@@ -293,13 +291,57 @@ By the end of this section, you have:
 |------|---------|
 | `README.md` | This guide |
 | `requirements.txt` | Python dependencies |
-| `src/mqtt_mcp_server.py` | Main MCP server implementation (built with Cursor) |
+| `src/mqtt_mcp_server.py` | Main MCP server implementation |
+| `src/mqtt_cache.json` | Runtime cache file (gitignored, auto-generated) |
 
 **Note:** Credentials are in the root `.env` file, not in this directory.
 
 ---
 
 ## Implementation Notes
+
+### Caching Architecture
+
+The server uses a flat-file cache for instant topic lookups:
+
+```
+┌─────────────────┐     subscribe #     ┌─────────────────┐
+│   MQTT Broker   │ ──────────────────► │   MCP Server    │
+│                 │ ◄────────────────── │                 │
+└─────────────────┘    all messages     └────────┬────────┘
+                                                 │
+                                          write on msg
+                                                 │
+                                                 ▼
+                                        ┌─────────────────┐
+                                        │ mqtt_cache.json │
+                                        │  {topic: value} │
+                                        └────────┬────────┘
+                                                 │
+                                            read from
+                                                 │
+                                                 ▼
+                                        ┌─────────────────┐
+                                        │   Tool Calls    │
+                                        │ (instant reads) │
+                                        └─────────────────┘
+```
+
+**How it works:**
+1. On connect: Subscribe to `#` (all topics)
+2. On message: Update `mqtt_cache.json` with topic → value
+3. On tool call: Read directly from cache file (instant)
+4. On disconnect: Clear cache file
+
+**Cache file format:**
+```json
+{
+  "flexpack/packaging/line1/filler/speed": {
+    "value": "125.5",
+    "timestamp": 1702742400.123
+  }
+}
+```
 
 ### Dynamic Client IDs
 

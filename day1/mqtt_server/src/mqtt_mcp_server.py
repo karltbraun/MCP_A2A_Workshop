@@ -5,14 +5,21 @@ MQTT MCP Server - UNS (Unified Namespace) Interface
 This MCP server connects to an MQTT broker and exposes UNS data to Claude Desktop
 through tools for reading and writing MQTT topics.
 
+Architecture:
+    - On connect: Subscribe to all topics (#) and cache values in a JSON file
+    - On message: Update the cache file with the latest value for each topic
+    - Cache persists across reconnections for stability
+    - Tools read from the cache file for instant responses
+
 Tools:
-    - list_uns_topics: Discover available topics via wildcard subscription
-    - get_topic_value: Read current retained value from a specific topic
+    - list_uns_topics: List all cached topics and their values
+    - get_topic_value: Get the cached value for a specific topic
     - search_topics: Find topics matching a pattern or keyword
     - publish_message: Publish a message to a specific topic
 """
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -22,6 +29,7 @@ from pathlib import Path
 from typing import Any
 import fnmatch
 import re
+import threading
 
 import paho.mqtt.client as mqtt
 from paho.mqtt.reasoncodes import ReasonCode
@@ -54,9 +62,12 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 _base_client_id = os.getenv("MQTT_CLIENT_ID", "mcp-mqtt")
 MQTT_CLIENT_ID = f"{_base_client_id}-{uuid.uuid4().hex[:8]}"
 
+# Cache file configuration
+CACHE_FILE = Path(__file__).parent / "mqtt_cache.json"
+
 
 class MQTTClientWrapper:
-    """Wrapper class for MQTT client with connection management."""
+    """Wrapper class for MQTT client with file-based caching."""
 
     def __init__(self):
         """Initialize MQTT client with v2.0+ API."""
@@ -67,10 +78,9 @@ class MQTTClientWrapper:
             clean_session=True,  # Don't persist session state
         )
         self.connected = False
-        self.messages: dict[str, dict[str, Any]] = {}
-        self._lock = asyncio.Lock()
-        self._message_event = asyncio.Event()
         self._reconnect_count = 0
+        self._cache_lock = threading.Lock()  # Thread-safe file access
+        self._message_count = 0
 
         # Set up callbacks
         self.client.on_connect = self._on_connect
@@ -85,6 +95,82 @@ class MQTTClientWrapper:
         # min_delay=1s, max_delay=120s - prevents rapid reconnection cycling
         self.client.reconnect_delay_set(min_delay=1, max_delay=120)
 
+        # Initialize cache file (create if doesn't exist, preserve if exists)
+        self._init_cache()
+
+    def _init_cache(self):
+        """Initialize cache file if it doesn't exist (preserves existing cache)."""
+        with self._cache_lock:
+            try:
+                if not CACHE_FILE.exists():
+                    with open(CACHE_FILE, 'w') as f:
+                        json.dump({}, f)
+                    logger.info(f"Created new cache file: {CACHE_FILE}")
+                else:
+                    # Load existing cache to get topic count
+                    try:
+                        with open(CACHE_FILE, 'r') as f:
+                            cache = json.load(f)
+                        logger.info(f"Loaded existing cache with {len(cache)} topics")
+                    except (json.JSONDecodeError, Exception):
+                        # If corrupted, start fresh
+                        with open(CACHE_FILE, 'w') as f:
+                            json.dump({}, f)
+                        logger.warning("Cache file was corrupted, starting fresh")
+            except Exception as e:
+                logger.error(f"Failed to initialize cache file: {e}")
+
+    def _clear_cache(self):
+        """Clear the cache file (write empty JSON object)."""
+        with self._cache_lock:
+            try:
+                with open(CACHE_FILE, 'w') as f:
+                    json.dump({}, f)
+                logger.debug(f"Cache file cleared: {CACHE_FILE}")
+            except Exception as e:
+                logger.error(f"Failed to clear cache file: {e}")
+
+    def _read_cache(self) -> dict[str, Any]:
+        """Read the current cache from file."""
+        with self._cache_lock:
+            try:
+                if CACHE_FILE.exists():
+                    with open(CACHE_FILE, 'r') as f:
+                        return json.load(f)
+            except json.JSONDecodeError:
+                logger.warning("Cache file corrupted, returning empty cache")
+            except Exception as e:
+                logger.error(f"Failed to read cache file: {e}")
+            return {}
+
+    def _write_to_cache(self, topic: str, value: str):
+        """Write/update a single topic value in the cache file."""
+        with self._cache_lock:
+            try:
+                # Read existing cache
+                cache = {}
+                if CACHE_FILE.exists():
+                    try:
+                        with open(CACHE_FILE, 'r') as f:
+                            cache = json.load(f)
+                    except (json.JSONDecodeError, Exception):
+                        cache = {}
+
+                # Update the topic value
+                cache[topic] = {
+                    "value": value,
+                    "timestamp": time.time(),
+                }
+
+                # Write back atomically (write to temp, then rename)
+                temp_file = CACHE_FILE.with_suffix('.tmp')
+                with open(temp_file, 'w') as f:
+                    json.dump(cache, f)
+                temp_file.replace(CACHE_FILE)
+
+            except Exception as e:
+                logger.error(f"Failed to write to cache file: {e}")
+
     def _on_connect(self, client, userdata, flags, reason_code, properties):
         """Callback for when the client connects to the broker."""
         if reason_code == 0 or (isinstance(reason_code, ReasonCode) and reason_code.is_failure is False):
@@ -94,6 +180,13 @@ class MQTTClientWrapper:
             else:
                 logger.info(f"Connected to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
             self._reconnect_count = 0
+
+            # Subscribe to all topics to populate cache
+            result, mid = self.client.subscribe("#", qos=1)
+            if result == mqtt.MQTT_ERR_SUCCESS:
+                logger.info("Subscribed to all topics (#) for caching")
+            else:
+                logger.error(f"Failed to subscribe to all topics: {result}")
         else:
             reason_str = self._get_reason_string(reason_code)
             logger.error(f"Connection failed: {reason_str}")
@@ -102,22 +195,25 @@ class MQTTClientWrapper:
         """Callback for when the client disconnects from the broker."""
         self.connected = False
         self._reconnect_count += 1
-        
+
+        # Cache persists across disconnections for stability
+        # (will be updated when connection is restored)
+
         reason_str = self._get_reason_string(reason_code)
-        
+
         # Only log as warning for unexpected disconnects
         # Normal disconnection (rc=0) or client-initiated are expected
         if reason_code == 0 or reason_str == "Normal disconnection":
             logger.info(f"Disconnected from MQTT broker: {reason_str}")
         else:
-            logger.warning(f"Disconnected from MQTT broker: {reason_str} (will auto-reconnect)")
+            logger.warning(f"Disconnected from MQTT broker: {reason_str} (will auto-reconnect, cache preserved)")
 
     def _get_reason_string(self, reason_code) -> str:
         """Convert reason code to human-readable string."""
         # Handle paho-mqtt ReasonCode objects
         if isinstance(reason_code, ReasonCode):
             return str(reason_code)
-        
+
         # Handle integer reason codes (MQTT 3.1.1 style)
         reason_map = {
             0: "Normal disconnection",
@@ -165,42 +261,38 @@ class MQTTClientWrapper:
         return reason_map.get(int(reason_code) if reason_code else 0, f"Unknown ({reason_code})")
 
     def _on_message(self, client, userdata, message):
-        """Callback for when a message is received."""
+        """Callback for when a message is received - updates cache file."""
         try:
             payload = message.payload.decode("utf-8")
         except UnicodeDecodeError:
             payload = str(message.payload)
 
-        self.messages[message.topic] = {
-            "topic": message.topic,
-            "payload": payload,
-            "qos": message.qos,
-            "retain": message.retain,
-            "timestamp": time.time(),
-        }
-        # Signal that a message was received
-        self._message_event.set()
-        logger.debug(f"Received message on {message.topic}: {payload[:100]}")
+        # Update the cache file with this topic's value
+        self._write_to_cache(message.topic, payload)
+        self._message_count += 1
+
+        logger.debug(f"Cached message on {message.topic}: {payload[:100]}")
 
     def connect(self):
         """Connect to the MQTT broker."""
         try:
             logger.info(f"Connecting to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}...")
             logger.info(f"Using client ID: {MQTT_CLIENT_ID}")
-            
+            logger.info(f"Cache file: {CACHE_FILE}")
+
             # Connect with keepalive of 60 seconds
             self.client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
-            
+
             # Start the network loop in a background thread
             # This handles reconnection automatically with the configured backoff
             self.client.loop_start()
-            
+
             # Wait for initial connection
             timeout = 10
             start = time.time()
             while not self.connected and (time.time() - start) < timeout:
                 time.sleep(0.1)
-            
+
             if not self.connected:
                 logger.error("Failed to connect to MQTT broker within timeout")
                 return False
@@ -210,10 +302,11 @@ class MQTTClientWrapper:
             return False
 
     def disconnect(self):
-        """Disconnect from the MQTT broker."""
+        """Disconnect from the MQTT broker (cache is preserved)."""
         self.client.loop_stop()
         self.client.disconnect()
-        logger.info("Disconnected from MQTT broker")
+        # Cache is preserved for stability across restarts
+        logger.info("Disconnected from MQTT broker (cache preserved)")
 
     def ensure_connected(self) -> bool:
         """Ensure the client is connected, reconnecting if necessary."""
@@ -221,84 +314,19 @@ class MQTTClientWrapper:
             return self.connect()
         return True
 
-    async def discover_topics(
-        self, base_path: str = "#", timeout: float = 3.0
-    ) -> dict[str, dict[str, Any]]:
-        """
-        Discover available topics by subscribing to a wildcard pattern.
+    def get_all_topics(self) -> dict[str, Any]:
+        """Get all cached topics and their values."""
+        return self._read_cache()
 
-        Args:
-            base_path: MQTT wildcard pattern (default: # for all topics)
-            timeout: How long to collect messages in seconds
+    def get_topic_value(self, topic: str) -> dict[str, Any] | None:
+        """Get a specific topic's cached value."""
+        cache = self._read_cache()
+        return cache.get(topic)
 
-        Returns:
-            Dictionary of discovered topics with their values
-        """
-        if not self.ensure_connected():
-            raise ConnectionError("Not connected to MQTT broker")
-
-        async with self._lock:
-            # Clear previous messages for fresh discovery
-            self.messages.clear()
-            self._message_event.clear()
-
-            # Subscribe to the wildcard pattern
-            result, mid = self.client.subscribe(base_path, qos=1)
-            if result != mqtt.MQTT_ERR_SUCCESS:
-                raise Exception(f"Failed to subscribe to {base_path}")
-
-            logger.info(f"Subscribed to {base_path}, collecting messages for {timeout}s...")
-
-            # Wait for messages to arrive
-            await asyncio.sleep(timeout)
-
-            # Unsubscribe
-            self.client.unsubscribe(base_path)
-
-            # Return a copy of collected messages
-            return dict(self.messages)
-
-    async def get_topic_value(
-        self, topic: str, timeout: float = 5.0
-    ) -> dict[str, Any] | None:
-        """
-        Get the current value of a specific topic.
-
-        Args:
-            topic: Full topic path
-            timeout: How long to wait for a message
-
-        Returns:
-            Message data if received, None if timeout
-        """
-        if not self.ensure_connected():
-            raise ConnectionError("Not connected to MQTT broker")
-
-        async with self._lock:
-            # Clear the specific topic from cache
-            if topic in self.messages:
-                del self.messages[topic]
-            self._message_event.clear()
-
-            # Subscribe to the specific topic
-            result, mid = self.client.subscribe(topic, qos=1)
-            if result != mqtt.MQTT_ERR_SUCCESS:
-                raise Exception(f"Failed to subscribe to {topic}")
-
-            logger.info(f"Subscribed to {topic}, waiting for message...")
-
-            # Wait for a message with timeout
-            start = time.time()
-            while (time.time() - start) < timeout:
-                if topic in self.messages:
-                    break
-                await asyncio.sleep(0.1)
-
-            # Unsubscribe
-            self.client.unsubscribe(topic)
-
-            # Return the message if received
-            return self.messages.get(topic)
+    def get_topic_count(self) -> int:
+        """Get the number of cached topics."""
+        cache = self._read_cache()
+        return len(cache)
 
     async def publish_message(
         self,
@@ -378,10 +406,10 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="list_uns_topics",
             description=(
-                "Discover available topics in the UNS (Unified Namespace) by subscribing "
-                "to a wildcard pattern and collecting messages for a brief period. "
-                "Use this to explore what data is available in the MQTT broker. "
-                "Returns a list of topic paths with their current values."
+                "List all topics currently available in the UNS (Unified Namespace) cache. "
+                "The cache is continuously updated with live data from the MQTT broker. "
+                "Use this to explore what data is available. "
+                "Returns topic paths with their current values."
             ),
             inputSchema={
                 "type": "object",
@@ -389,19 +417,11 @@ async def list_tools() -> list[Tool]:
                     "base_path": {
                         "type": "string",
                         "description": (
-                            "MQTT wildcard pattern to subscribe to. Use '#' for all topics, "
-                            "or a specific path like 'flexpack/#' for a subtree. "
-                            "Default is '#' (all topics)."
+                            "Optional filter: only return topics starting with this path prefix. "
+                            "Example: 'flexpack/packaging' to see only packaging topics. "
+                            "Leave empty or use '#' for all topics."
                         ),
                         "default": "#",
-                    },
-                    "timeout": {
-                        "type": "number",
-                        "description": (
-                            "How long to collect messages in seconds. Longer timeout = more topics discovered. "
-                            "Default is 3 seconds."
-                        ),
-                        "default": 3,
                     },
                 },
                 "required": [],
@@ -410,8 +430,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="get_topic_value",
             description=(
-                "Read the current retained value from a specific MQTT topic. "
-                "Use this when you know the exact topic path and want to read its current value. "
+                "Get the current cached value for a specific MQTT topic. "
+                "Returns the latest value received from the broker. "
                 "Example topic: 'flexpack/packaging/line1/filler/speed'"
             ),
             inputSchema={
@@ -423,13 +443,6 @@ async def list_tools() -> list[Tool]:
                             "Full topic path to read, e.g., 'flexpack/packaging/line1/filler/speed'"
                         ),
                     },
-                    "timeout": {
-                        "type": "number",
-                        "description": (
-                            "How long to wait for a message in seconds. Default is 5 seconds."
-                        ),
-                        "default": 5,
-                    },
                 },
                 "required": ["topic"],
             },
@@ -437,8 +450,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="search_topics",
             description=(
-                "Find topics matching a pattern or keyword. "
-                "Use this when you want to find topics by name without knowing the exact path. "
+                "Search cached topics matching a pattern or keyword. "
+                "Use this to find topics by name without knowing the exact path. "
                 "Supports glob patterns (*, ?) and simple keyword search."
             ),
             inputSchema={
@@ -452,13 +465,6 @@ async def list_tools() -> list[Tool]:
                             "2) A glob pattern with wildcards (e.g., '*speed*', 'line1/*'), "
                             "3) An MQTT wildcard pattern (e.g., 'flexpack/+/line1/#')"
                         ),
-                    },
-                    "timeout": {
-                        "type": "number",
-                        "description": (
-                            "How long to collect topics before searching in seconds. Default is 3 seconds."
-                        ),
-                        "default": 3,
                     },
                 },
                 "required": ["pattern"],
@@ -531,82 +537,114 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 async def handle_list_uns_topics(arguments: dict[str, Any]) -> list[TextContent]:
     """
-    Discover available topics in the UNS.
+    List all cached topics from the UNS.
 
-    Subscribes to a wildcard pattern and collects messages for a brief period
-    to discover what topics are available.
+    Reads from the cache file which is continuously updated
+    with live data from the MQTT broker.
     """
     base_path = arguments.get("base_path", "#")
-    timeout = arguments.get("timeout", 3.0)
 
     try:
-        topics = await mqtt_client.discover_topics(base_path, timeout)
-
-        if not topics:
+        if not mqtt_client.connected:
             return [
                 TextContent(
                     type="text",
-                    text=f"No topics discovered with pattern '{base_path}' within {timeout} seconds. "
-                    "The broker may have no retained messages, or the pattern may not match any topics.",
+                    text="Not connected to MQTT broker. Cache may be empty.",
+                )
+            ]
+
+        all_topics = mqtt_client.get_all_topics()
+
+        if not all_topics:
+            return [
+                TextContent(
+                    type="text",
+                    text="No topics in cache. The broker may have no retained messages, "
+                    "or the connection was just established (wait a moment for messages to arrive).",
+                )
+            ]
+
+        # Filter by base_path if specified
+        if base_path and base_path != "#":
+            filtered_topics = {
+                k: v for k, v in all_topics.items()
+                if k.startswith(base_path.rstrip('/'))
+            }
+        else:
+            filtered_topics = all_topics
+
+        if not filtered_topics:
+            return [
+                TextContent(
+                    type="text",
+                    text=f"No topics found matching prefix '{base_path}'. "
+                    f"Total topics in cache: {len(all_topics)}",
                 )
             ]
 
         # Format the results
-        result_lines = [f"Discovered {len(topics)} topics:\n"]
-        for topic_path, data in sorted(topics.items()):
-            payload = data.get("payload", "")
-            # Truncate long payloads for readability
-            if len(payload) > 100:
-                payload = payload[:100] + "..."
-            result_lines.append(f"  • {topic_path}: {payload}")
+        result_lines = [f"Found {len(filtered_topics)} topics:\n"]
+        for topic_path in sorted(filtered_topics.keys()):
+            data = filtered_topics[topic_path]
+            value = data.get("value", "")
+            # Truncate long values for readability
+            if len(value) > 100:
+                value = value[:100] + "..."
+            result_lines.append(f"  • {topic_path}: {value}")
 
         return [TextContent(type="text", text="\n".join(result_lines))]
 
-    except ConnectionError as e:
-        return [TextContent(type="text", text=f"Connection error: {e}")]
     except Exception as e:
         logger.exception("Error in list_uns_topics")
-        return [TextContent(type="text", text=f"Error discovering topics: {e}")]
+        return [TextContent(type="text", text=f"Error listing topics: {e}")]
 
 
 async def handle_get_topic_value(arguments: dict[str, Any]) -> list[TextContent]:
     """
-    Read the current value from a specific topic.
+    Get the cached value for a specific topic.
 
-    Subscribes to the exact topic path and waits for a retained message
-    or a new publish.
+    Reads from the cache file for instant response.
     """
     topic = arguments.get("topic")
     if not topic:
         return [TextContent(type="text", text="Error: 'topic' parameter is required")]
 
-    timeout = arguments.get("timeout", 5.0)
-
     try:
-        result = await mqtt_client.get_topic_value(topic, timeout)
-
-        if result is None:
+        if not mqtt_client.connected:
             return [
                 TextContent(
                     type="text",
-                    text=f"No message received on topic '{topic}' within {timeout} seconds. "
-                    "The topic may not exist or have no retained message.",
+                    text="Not connected to MQTT broker. Cache may be stale.",
+                )
+            ]
+
+        result = mqtt_client.get_topic_value(topic)
+
+        if result is None:
+            # Check if we have any topics to give context
+            topic_count = mqtt_client.get_topic_count()
+            return [
+                TextContent(
+                    type="text",
+                    text=f"Topic '{topic}' not found in cache. "
+                    f"Total topics in cache: {topic_count}. "
+                    "The topic may not exist or hasn't published a message yet.",
                 )
             ]
 
         # Format the result
+        timestamp = result.get("timestamp", 0)
+        age_seconds = time.time() - timestamp if timestamp else 0
+
         output = [
-            f"Topic: {result['topic']}",
-            f"Value: {result['payload']}",
-            f"QoS: {result['qos']}",
-            f"Retained: {result['retain']}",
-            f"Received at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(result['timestamp']))}",
+            f"Topic: {topic}",
+            f"Value: {result['value']}",
+            f"Last updated: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(timestamp))}",
+            f"Age: {age_seconds:.1f} seconds ago",
         ]
 
         return [TextContent(type="text", text="\n".join(output))]
 
-    except ConnectionError as e:
-        return [TextContent(type="text", text=f"Connection error: {e}")]
     except Exception as e:
         logger.exception("Error in get_topic_value")
         return [TextContent(type="text", text=f"Error reading topic: {e}")]
@@ -614,26 +652,30 @@ async def handle_get_topic_value(arguments: dict[str, Any]) -> list[TextContent]
 
 async def handle_search_topics(arguments: dict[str, Any]) -> list[TextContent]:
     """
-    Find topics matching a pattern or keyword.
+    Search cached topics matching a pattern or keyword.
 
-    Uses list_uns_topics internally, then filters results by the pattern.
-    Supports glob patterns and simple keyword matching.
+    Reads from the cache file and filters by pattern.
     """
     pattern = arguments.get("pattern")
     if not pattern:
         return [TextContent(type="text", text="Error: 'pattern' parameter is required")]
 
-    timeout = arguments.get("timeout", 3.0)
-
     try:
-        # First, discover all topics
-        all_topics = await mqtt_client.discover_topics("#", timeout)
+        if not mqtt_client.connected:
+            return [
+                TextContent(
+                    type="text",
+                    text="Not connected to MQTT broker. Cache may be empty.",
+                )
+            ]
+
+        all_topics = mqtt_client.get_all_topics()
 
         if not all_topics:
             return [
                 TextContent(
                     type="text",
-                    text=f"No topics discovered to search through. "
+                    text="No topics in cache to search through. "
                     "The broker may have no retained messages.",
                 )
             ]
@@ -670,7 +712,7 @@ async def handle_search_topics(arguments: dict[str, Any]) -> list[TextContent]:
                 TextContent(
                     type="text",
                     text=f"No topics found matching pattern '{pattern}'. "
-                    f"Searched through {len(all_topics)} available topics.",
+                    f"Searched through {len(all_topics)} cached topics.",
                 )
             ]
 
@@ -678,17 +720,16 @@ async def handle_search_topics(arguments: dict[str, Any]) -> list[TextContent]:
         result_lines = [
             f"Found {len(matching_topics)} topics matching '{pattern}':\n"
         ]
-        for topic_path, data in sorted(matching_topics.items()):
-            payload = data.get("payload", "")
-            # Truncate long payloads for readability
-            if len(payload) > 100:
-                payload = payload[:100] + "..."
-            result_lines.append(f"  • {topic_path}: {payload}")
+        for topic_path in sorted(matching_topics.keys()):
+            data = matching_topics[topic_path]
+            value = data.get("value", "")
+            # Truncate long values for readability
+            if len(value) > 100:
+                value = value[:100] + "..."
+            result_lines.append(f"  • {topic_path}: {value}")
 
         return [TextContent(type="text", text="\n".join(result_lines))]
 
-    except ConnectionError as e:
-        return [TextContent(type="text", text=f"Connection error: {e}")]
     except Exception as e:
         logger.exception("Error in search_topics")
         return [TextContent(type="text", text=f"Error searching topics: {e}")]
@@ -760,6 +801,7 @@ async def main():
     logger.info("Starting MQTT MCP Server...")
     logger.info(f"MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
     logger.info(f"Client ID: {MQTT_CLIENT_ID}")
+    logger.info(f"Cache file: {CACHE_FILE}")
 
     # Connect to MQTT broker
     if not mqtt_client.connect():
