@@ -61,8 +61,9 @@ MQTT_BROKER=balancer.virtualfactory.online
 MQTT_PORT=1883
 MQTT_USERNAME=your_username
 MQTT_PASSWORD=your_password
-MQTT_CLIENT_ID=mcp-mqtt           # Optional: base client ID (unique suffix added automatically)
 ```
+
+**Note:** The MQTT client ID is automatically generated with a unique suffix (e.g., `mcp-mqtt-a1b2c3d4`) to allow multiple MCP server instances to run simultaneously without conflicts.
 
 ### 3. Initialize Virtual Environment
 
@@ -300,14 +301,16 @@ By the end of this section, you have:
 
 ## Implementation Notes
 
-### Unique Client IDs
+### Dynamic Client IDs
 
-The server automatically generates unique MQTT client IDs to prevent "session taken over" disconnections when multiple instances run:
+The server automatically generates unique MQTT client IDs to allow multiple MCP server instances to run simultaneously (e.g., Claude Desktop + manual testing):
 
 ```python
-# Generates: mcp-mqtt-a1b2c3d4 (unique suffix)
-MQTT_CLIENT_ID = f"{base_client_id}-{uuid.uuid4().hex[:8]}"
+# Generates: mcp-mqtt-a1b2c3d4 (unique suffix each time)
+MQTT_CLIENT_ID = f"mcp-mqtt-{uuid.uuid4().hex[:8]}"
 ```
+
+This prevents "session taken over" disconnections that occur when two clients use the same ID.
 
 ### Reconnection Handling
 

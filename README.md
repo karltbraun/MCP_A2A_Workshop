@@ -125,8 +125,9 @@ Data comes from the Flexible Packager virtual factory built for ProveIt! Confere
 
 | Schema | Purpose |
 |--------|---------|
-| mes_lite | Core MES data -- work orders, production runs, equipment |
+| hivemq_ese_db | HiveMQ Enterprise Security -- user accounts and broker permissions |
 | mes_custom | Custom extensions and user-defined fields |
+| mes_lite | Core MES data -- work orders, production runs, equipment |
 | proveitdb | ProveIt! demo data -- batches, quality checks, recipes |
 
 ---
@@ -162,13 +163,15 @@ MQTT_BROKER=balancer.virtualfactory.online
 MQTT_PORT=1883
 MQTT_USERNAME=your_username
 MQTT_PASSWORD=your_password
+# Note: MQTT_CLIENT_ID is auto-generated with a unique suffix (e.g., mcp-mqtt-a1b2c3d4)
+# to allow multiple MCP server instances to run simultaneously without conflicts
 
 # MySQL Database Configuration
 MYSQL_HOST=proveit.virtualfactory.online
 MYSQL_PORT=3306
 MYSQL_USERNAME=your_username
 MYSQL_PASSWORD=your_password
-MYSQL_SCHEMAS=mes_lite,mes_custom,proveitdb
+MYSQL_SCHEMAS=hivemq_ese_db,mes_custom,mes_lite,proveitdb
 ```
 
 ---

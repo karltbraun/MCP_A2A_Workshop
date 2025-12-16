@@ -61,8 +61,10 @@ MYSQL_HOST=proveit.virtualfactory.online
 MYSQL_PORT=3306
 MYSQL_USERNAME=your_username
 MYSQL_PASSWORD=your_password
-MYSQL_SCHEMAS=mes_lite,mes_custom,proveitdb
+MYSQL_SCHEMAS=hivemq_ese_db,mes_custom,mes_lite,proveitdb
 ```
+
+**Note:** The `MYSQL_SCHEMAS` variable defines which schemas the MCP server can access. All four schemas from the Virtual Factory database are included.
 
 ### 3. Initialize Virtual Environment
 
@@ -91,11 +93,14 @@ pip install -r requirements.txt
 
 ### Available Schemas
 
-| Schema | Purpose | Key Tables |
-|--------|---------|------------|
-| mes_lite | Core MES data | work_orders, production_runs, equipment |
-| mes_custom | Custom extensions | custom_attributes, user_defined_fields |
-| proveitdb | ProveIt! demo data | batches, quality_checks, recipes |
+| Schema | Purpose | Description |
+|--------|---------|-------------|
+| hivemq_ese_db | HiveMQ Enterprise Security | User accounts and permissions for the Virtual Factory MQTT broker |
+| mes_custom | Custom MES extensions | Custom attributes, user-defined fields, extended configurations |
+| mes_lite | Core MES data | Work orders, production runs, equipment, operators, materials |
+| proveitdb | ProveIt! demo data | Batch records, quality checks, recipes, process parameters |
+
+All four schemas are accessible to the MCP server and can be queried using natural language through Claude.
 
 ---
 
@@ -154,32 +159,30 @@ Runs a SELECT query and returns results.
 
 ### Update Config File
 
-Add the MySQL server alongside the existing MQTT server:
+Add the MySQL server alongside the existing MQTT server. Use the **venv Python interpreter** for each server:
 
 ```json
 {
   "mcpServers": {
     "mqtt-uns": {
-      "command": "python",
+      "command": "/path/to/MCP_A2A_Workshop/day1/mqtt_server/venv/bin/python",
       "args": ["/path/to/MCP_A2A_Workshop/day1/mqtt_server/src/mqtt_mcp_server.py"]
     },
     "mysql-mes": {
-      "command": "python",
-      "args": ["/path/to/MCP_A2A_Workshop/day1/mysql_server/src/mysql_mcp_server.py"],
-      "env": {
-        "MYSQL_HOST": "proveit.virtualfactory.online",
-        "MYSQL_PORT": "3306"
-      }
+      "command": "/path/to/MCP_A2A_Workshop/day1/mysql_server/venv/bin/python",
+      "args": ["/path/to/MCP_A2A_Workshop/day1/mysql_server/src/mysql_mcp_server.py"]
     }
   }
 }
 ```
 
+**Note:** Both servers load credentials from the root `.env` file automatically — no need to pass environment variables in the config.
+
 ### Restart Claude Desktop
 
 - Quit completely
 - Relaunch
-- Verify both servers appear in the MCP server list
+- Verify both servers appear in the MCP server list (hammer icon)
 
 ---
 
