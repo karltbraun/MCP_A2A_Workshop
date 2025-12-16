@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-MQTT MCP Server - Read-Only Phase 1
+MQTT MCP Server - UNS (Unified Namespace) Interface
 
-This MCP server connects to an MQTT broker and exposes UNS (Unified Namespace) 
-data to Claude Desktop through read-only tools.
+This MCP server connects to an MQTT broker and exposes UNS data to Claude Desktop
+through tools for reading and writing MQTT topics.
 
 Tools:
     - list_uns_topics: Discover available topics via wildcard subscription
     - get_topic_value: Read current retained value from a specific topic
     - search_topics: Find topics matching a pattern or keyword
+    - publish_message: Publish a message to a specific topic
 """
 
 import asyncio
@@ -299,6 +300,69 @@ class MQTTClientWrapper:
             # Return the message if received
             return self.messages.get(topic)
 
+    async def publish_message(
+        self,
+        topic: str,
+        payload: str,
+        retain: bool = False,
+        qos: int = 1,
+    ) -> dict[str, Any]:
+        """
+        Publish a message to a specific topic.
+
+        Args:
+            topic: Full topic path to publish to
+            payload: Message payload (string)
+            retain: Whether to retain the message on the broker (default: False)
+            qos: Quality of Service level 0, 1, or 2 (default: 1)
+
+        Returns:
+            Dictionary with publish result details
+        """
+        if not self.ensure_connected():
+            raise ConnectionError("Not connected to MQTT broker")
+
+        # Validate QoS
+        if qos not in (0, 1, 2):
+            raise ValueError(f"Invalid QoS level: {qos}. Must be 0, 1, or 2.")
+
+        # Validate topic (basic validation)
+        if not topic or not topic.strip():
+            raise ValueError("Topic cannot be empty")
+        if "#" in topic or "+" in topic:
+            raise ValueError("Cannot publish to wildcard topics (# or +)")
+
+        # Log the publish operation for safety/auditing
+        logger.info(f"Publishing to '{topic}': payload='{payload[:100]}{'...' if len(payload) > 100 else ''}', retain={retain}, qos={qos}")
+
+        # Publish the message
+        result = self.client.publish(topic, payload, qos=qos, retain=retain)
+
+        # Wait for publish to complete (for QoS > 0)
+        if qos > 0:
+            result.wait_for_publish(timeout=10)
+
+        if result.rc == mqtt.MQTT_ERR_SUCCESS:
+            logger.info(f"Successfully published to '{topic}'")
+            return {
+                "success": True,
+                "topic": topic,
+                "payload": payload,
+                "retain": retain,
+                "qos": qos,
+                "message_id": result.mid,
+                "timestamp": time.time(),
+            }
+        else:
+            error_msg = f"Publish failed with error code: {result.rc}"
+            logger.error(error_msg)
+            return {
+                "success": False,
+                "topic": topic,
+                "error": error_msg,
+                "error_code": result.rc,
+            }
+
 
 # Create global MQTT client instance
 mqtt_client = MQTTClientWrapper()
@@ -400,6 +464,52 @@ async def list_tools() -> list[Tool]:
                 "required": ["pattern"],
             },
         ),
+        Tool(
+            name="publish_message",
+            description=(
+                "Publish a message to a specific MQTT topic in the UNS. "
+                "Use this to write data back to the Unified Namespace. "
+                "Example: publish 'hello from claude' to 'flexpack/test/claude'. "
+                "WARNING: This writes to the live MQTT broker - use with caution."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": (
+                            "Full topic path to publish to, e.g., 'flexpack/test/claude'. "
+                            "Cannot contain wildcards (# or +)."
+                        ),
+                    },
+                    "payload": {
+                        "type": "string",
+                        "description": (
+                            "The message payload to publish. Can be any string value, "
+                            "including JSON-formatted data."
+                        ),
+                    },
+                    "retain": {
+                        "type": "boolean",
+                        "description": (
+                            "Whether to retain the message on the broker. Retained messages "
+                            "are stored and sent to new subscribers. Default is false."
+                        ),
+                        "default": False,
+                    },
+                    "qos": {
+                        "type": "integer",
+                        "description": (
+                            "Quality of Service level: 0 (at most once), 1 (at least once), "
+                            "or 2 (exactly once). Default is 1."
+                        ),
+                        "default": 1,
+                        "enum": [0, 1, 2],
+                    },
+                },
+                "required": ["topic", "payload"],
+            },
+        ),
     ]
 
 
@@ -413,6 +523,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         return await handle_get_topic_value(arguments)
     elif name == "search_topics":
         return await handle_search_topics(arguments)
+    elif name == "publish_message":
+        return await handle_publish_message(arguments)
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -582,9 +694,70 @@ async def handle_search_topics(arguments: dict[str, Any]) -> list[TextContent]:
         return [TextContent(type="text", text=f"Error searching topics: {e}")]
 
 
+async def handle_publish_message(arguments: dict[str, Any]) -> list[TextContent]:
+    """
+    Publish a message to a specific MQTT topic.
+
+    Validates inputs and publishes the message to the broker.
+    All publish operations are logged for safety/auditing.
+    """
+    topic = arguments.get("topic")
+    payload = arguments.get("payload")
+    retain = arguments.get("retain", False)
+    qos = arguments.get("qos", 1)
+
+    # Validate required parameters
+    if not topic:
+        return [TextContent(type="text", text="Error: 'topic' parameter is required")]
+    if payload is None:
+        return [TextContent(type="text", text="Error: 'payload' parameter is required")]
+
+    # Convert payload to string if needed
+    if not isinstance(payload, str):
+        payload = str(payload)
+
+    try:
+        result = await mqtt_client.publish_message(
+            topic=topic,
+            payload=payload,
+            retain=retain,
+            qos=qos,
+        )
+
+        if result.get("success"):
+            # Format success message
+            output = [
+                "✓ Message published successfully!",
+                "",
+                f"Topic: {result['topic']}",
+                f"Payload: {result['payload']}",
+                f"Retain: {result['retain']}",
+                f"QoS: {result['qos']}",
+                f"Message ID: {result['message_id']}",
+                f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(result['timestamp']))}",
+            ]
+            return [TextContent(type="text", text="\n".join(output))]
+        else:
+            # Format error message
+            return [
+                TextContent(
+                    type="text",
+                    text=f"✗ Publish failed: {result.get('error', 'Unknown error')}",
+                )
+            ]
+
+    except ValueError as e:
+        return [TextContent(type="text", text=f"Validation error: {e}")]
+    except ConnectionError as e:
+        return [TextContent(type="text", text=f"Connection error: {e}")]
+    except Exception as e:
+        logger.exception("Error in publish_message")
+        return [TextContent(type="text", text=f"Error publishing message: {e}")]
+
+
 async def main():
     """Main entry point for the MCP server."""
-    logger.info("Starting MQTT MCP Server (Read-Only Phase 1)...")
+    logger.info("Starting MQTT MCP Server...")
     logger.info(f"MQTT Broker: {MQTT_BROKER}:{MQTT_PORT}")
     logger.info(f"Client ID: {MQTT_CLIENT_ID}")
 
